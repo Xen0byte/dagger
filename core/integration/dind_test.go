@@ -1,15 +1,15 @@
 package core
 
 import (
-	"testing"
+	"context"
+
+	"github.com/stretchr/testify/require"
 
 	"github.com/dagger/dagger/internal/testutil"
-	"github.com/stretchr/testify/require"
+	"github.com/dagger/dagger/testctx"
 )
 
-func TestDIND(t *testing.T) {
-	t.Parallel()
-
+func (ContainerSuite) TestDIND(ctx context.Context, t *testctx.T) {
 	var res struct {
 		Container struct {
 			From struct {
@@ -22,7 +22,7 @@ func TestDIND(t *testing.T) {
 		}
 	}
 
-	err := testutil.Query(
+	err := testutil.Query(t,
 		`
 {
   container {
@@ -30,12 +30,13 @@ func TestDIND(t *testing.T) {
       withExec(args: ["apk", "add", "curl"]) {
         withExec(args: ["sh", "-c", """
 
-touch /root/1 /root/2
+mkdir /root/dir
+touch /root/dir/1 /root/dir/2
 
 curl \
 -u $DAGGER_SESSION_TOKEN: \
 -H "content-type:application/json" \
--d '{"query":"{host{directory(path:\"/root\"){entries}}}"}' http://127.0.0.1:$DAGGER_SESSION_PORT/query
+-d '{"query":"{host{directory(path:\"/root/dir\"){entries}}}"}' http://127.0.0.1:$DAGGER_SESSION_PORT/query
         """], experimentalPrivilegedNesting: true) {
           stdout
         }

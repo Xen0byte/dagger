@@ -11,15 +11,20 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
+
+	"dagger.io/dagger/telemetry"
 )
 
 type cliSessionConn struct {
 	*http.Client
-	childCancel func()
+	childCancel context.CancelCauseFunc
 	childProc   *exec.Cmd
+	stderrBuf   *safeBuffer
+	ioWait      *sync.WaitGroup
 }
 
 func (c *cliSessionConn) Host() string {
@@ -28,32 +33,80 @@ func (c *cliSessionConn) Host() string {
 
 func (c *cliSessionConn) Close() error {
 	if c.childCancel != nil && c.childProc != nil {
-		c.childCancel()
+		c.childCancel(errors.New("client closed"))
 		err := c.childProc.Wait()
 		if err != nil {
-			if errors.Is(err, context.Canceled) {
-				// expected
-				return nil
+			// only context canceled is expected
+			if !errors.Is(err, context.Canceled) {
+				return fmt.Errorf("close: %w\nstderr:\n%s", err, c.stderrBuf.String())
 			}
-
-			return err
 		}
+		c.ioWait.Wait()
 	}
 	return nil
 }
 
+func getSDKVersion() string {
+	version := "n/a"
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return version
+	}
+
+	for _, dep := range info.Deps {
+		if dep.Path == "dagger.io/dagger" {
+			version = dep.Version
+			if version[0] == 'v' {
+				version = version[1:]
+			}
+			break
+		}
+	}
+	return version
+}
+
+type flagValue struct {
+	flag  string
+	value string
+}
+
 func startCLISession(ctx context.Context, binPath string, cfg *Config) (_ EngineConn, rerr error) {
 	args := []string{"session"}
-	if cfg.Workdir != "" {
-		args = append(args, "--workdir", cfg.Workdir)
+
+	version := getSDKVersion()
+
+	flagsAndValues := []flagValue{
+		{"--workdir", cfg.Workdir},
+		{"--label", "dagger.io/sdk.name:go"},
+		{"--label", fmt.Sprintf("dagger.io/sdk.version:%s", version)},
 	}
-	if cfg.ConfigPath != "" {
-		args = append(args, "--project", cfg.ConfigPath)
+	if cfg.VersionOverride != "" {
+		flagsAndValues = append(flagsAndValues, flagValue{"--version", cfg.VersionOverride})
+	}
+
+	for _, pair := range flagsAndValues {
+		if pair.value != "" {
+			args = append(args, pair.flag, pair.value)
+		}
+	}
+
+	if cfg.Verbosity > 0 {
+		args = append(args, "-"+strings.Repeat("v", cfg.Verbosity))
 	}
 
 	env := os.Environ()
 
-	cmdCtx, cmdCancel := context.WithCancel(ctx)
+	if cfg.RunnerHost != "" {
+		env = append(env, "_EXPERIMENTAL_DAGGER_RUNNER_HOST="+cfg.RunnerHost)
+	}
+
+	// detect $TRACEPARENT set by 'dagger run'
+	ctx = fallbackSpanContext(ctx)
+
+	// propagate trace context to the child process (i.e. for Dagger-in-Dagger)
+	env = append(env, telemetry.PropagationEnv(ctx)...)
+
+	cmdCtx, cmdCancel := context.WithCancelCause(ctx)
 
 	// Workaround https://github.com/golang/go/issues/22315
 	// Basically, if any other code in this process does fork/exec, it may
@@ -69,23 +122,28 @@ func startCLISession(ctx context.Context, binPath string, cfg *Config) (_ Engine
 	// threads within this process are trying to provision it at the same time.
 	var proc *exec.Cmd
 	var stdout io.ReadCloser
-	var stderrBuf *bytes.Buffer
+	var stderrBuf *safeBuffer
 	var childStdin io.WriteCloser
-	for i := 0; i < 10; i++ {
+	var ioWait *sync.WaitGroup
+
+	if cfg.LogOutput != nil {
+		fmt.Fprintf(cfg.LogOutput, "Creating new Engine session... ")
+	}
+
+	for range 10 {
 		proc = exec.CommandContext(cmdCtx, binPath, args...)
 		proc.Env = env
 
 		var err error
 		stdout, err = proc.StdoutPipe()
 		if err != nil {
-			cmdCancel()
+			cmdCancel(fmt.Errorf("failed to create stdout pipe: %w", err))
 			return nil, err
 		}
-		defer stdout.Close() // don't need it after we read the port
 
 		stderrPipe, err := proc.StderrPipe()
 		if err != nil {
-			cmdCancel()
+			cmdCancel(fmt.Errorf("failed to create stderr pipe: %w", err))
 			return nil, err
 		}
 		if cfg.LogOutput == nil {
@@ -96,9 +154,14 @@ func startCLISession(ctx context.Context, binPath string, cfg *Config) (_ Engine
 		// of this function so we can return it in the error if something
 		// goes wrong here. Otherwise the only error ends up being EOF and
 		// the user has to enable log output to see anything.
-		stderrBuf = bytes.NewBuffer(nil)
+		stderrBuf = &safeBuffer{}
 		discardableBuf := &discardableWriter{w: stderrBuf}
-		go io.Copy(io.MultiWriter(cfg.LogOutput, discardableBuf), stderrPipe)
+		ioWait = new(sync.WaitGroup)
+		ioWait.Add(1)
+		go func() {
+			defer ioWait.Done()
+			io.Copy(io.MultiWriter(cfg.LogOutput, discardableBuf), stderrPipe)
+		}()
 		defer discardableBuf.Discard()
 
 		// Open a stdin pipe with the child process. The engine-session shutsdown
@@ -106,7 +169,7 @@ func startCLISession(ctx context.Context, binPath string, cfg *Config) (_ Engine
 		// we don't leak child processes even if this process is SIGKILL'd.
 		childStdin, err = proc.StdinPipe()
 		if err != nil {
-			cmdCancel()
+			cmdCancel(fmt.Errorf("failed to create stdin pipe: %w", err))
 			return nil, err
 		}
 
@@ -130,58 +193,75 @@ func startCLISession(ctx context.Context, binPath string, cfg *Config) (_ Engine
 				childStdin = nil
 				continue
 			}
-			cmdCancel()
+			cmdCancel(fmt.Errorf("failed to start dagger session process: %w", err))
 			return nil, err
 		}
 		break
 	}
 	if proc == nil {
-		cmdCancel()
-		return nil, fmt.Errorf("failed to start dagger session")
+		err := fmt.Errorf("failed to start dagger session")
+		cmdCancel(err)
+		return nil, err
 	}
 
 	defer func() {
 		if rerr != nil {
 			stderrContents := stderrBuf.String()
 			if stderrContents != "" {
-				rerr = fmt.Errorf("%s: %s", rerr, stderrContents)
+				rerr = fmt.Errorf("%w: %s", rerr, stderrContents)
 			}
 		}
 	}()
+
+	if cfg.LogOutput != nil {
+		fmt.Fprintf(cfg.LogOutput, "OK!\nEstablishing connection to Engine... ")
+	}
 
 	// Read the connect params from stdout.
 	paramCh := make(chan error, 1)
 	var params ConnectParams
 	go func() {
-		defer close(paramCh)
-		paramBytes, err := bufio.NewReader(stdout).ReadBytes('\n')
+		stdout := bufio.NewReader(stdout)
+		paramBytes, err := stdout.ReadBytes('\n')
 		if err != nil {
 			paramCh <- err
 			return
 		}
 		if err := json.Unmarshal(paramBytes, &params); err != nil {
 			paramCh <- err
+			return
 		}
+		close(paramCh)
+
+		io.Copy(io.Discard, stdout)
 	}()
 
 	select {
 	case err := <-paramCh:
 		if err != nil {
-			cmdCancel()
+			err = fmt.Errorf("failed to read session params: %w", err)
+			cmdCancel(err)
 			return nil, err
 		}
 
 	case <-time.After(300 * time.Second):
 		// really long time to account for extensions that need to build, though
 		// that path should be optimized in future
-		cmdCancel()
-		return nil, fmt.Errorf("timed out waiting for session params")
+		err := fmt.Errorf("timed out waiting for session params")
+		cmdCancel(err)
+		return nil, err
+	}
+
+	if cfg.LogOutput != nil {
+		fmt.Fprintln(cfg.LogOutput, "OK!")
 	}
 
 	return &cliSessionConn{
 		Client:      defaultHTTPClient(&params),
 		childCancel: cmdCancel,
 		childProc:   proc,
+		stderrBuf:   stderrBuf,
+		ioWait:      ioWait,
 	}, nil
 }
 
@@ -201,4 +281,21 @@ func (w *discardableWriter) Discard() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.w = io.Discard
+}
+
+type safeBuffer struct {
+	bu bytes.Buffer
+	mu sync.Mutex
+}
+
+func (s *safeBuffer) Write(p []byte) (n int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.bu.Write(p)
+}
+
+func (s *safeBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.bu.String()
 }

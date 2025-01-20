@@ -2,121 +2,141 @@ package core
 
 import (
 	"context"
-	"crypto/sha256"
 	"fmt"
-	"os"
+	"sync"
 
-	bkgw "github.com/moby/buildkit/frontend/gateway/client"
+	"github.com/moby/buildkit/session/secrets"
+	"github.com/opencontainers/go-digest"
+	"github.com/vektah/gqlparser/v2/ast"
 )
 
 // Secret is a content-addressed secret.
 type Secret struct {
-	ID SecretID `json:"id"`
+	Query *Query
+
+	// The digest of the DagQL ID that accessed this secret, used as its identifier
+	// in secret stores.
+	IDDigest digest.Digest
 }
 
-func NewSecret(id SecretID) *Secret {
-	return &Secret{ID: id}
+func (*Secret) Type() *ast.Type {
+	return &ast.Type{
+		NamedType: "Secret",
+		NonNull:   true,
+	}
 }
 
-func NewSecretFromFile(fileID FileID) (*Secret, error) {
-	id, err := (&secretIDPayload{FromFile: fileID}).Encode()
-	if err != nil {
-		return nil, err
-	}
-
-	return NewSecret(id), nil
+func (*Secret) TypeDescription() string {
+	return "A reference to a secret value, which can be handled more safely than the value itself."
 }
 
-func NewSecretFromHostEnv(name string) (*Secret, error) {
-	id, err := (&secretIDPayload{FromHostEnv: name}).Encode()
-	if err != nil {
-		return nil, err
-	}
-
-	return NewSecret(id), nil
+func (secret *Secret) Clone() *Secret {
+	cp := *secret
+	return &cp
 }
 
-// SecretID is an opaque value representing a content-addressed secret.
-type SecretID string
-
-func NewSecretID(name, plaintext string) (SecretID, error) {
-	digestBytes := sha256.Sum256([]byte(plaintext))
-
-	id, err := (&secretIDPayload{Name: name, Digest: string(digestBytes[:])}).Encode()
-	if err != nil {
-		return "", err
-	}
-	return id, nil
+func (secret *Secret) LLBID() string {
+	return string(secret.IDDigest)
 }
 
-func (id SecretID) String() string { return string(id) }
-
-func (id SecretID) IsOldFormat() (bool, error) {
-	payload, err := id.decode()
-	if err != nil {
-		return false, err
-	}
-
-	if payload.FromFile == "" && payload.FromHostEnv == "" {
-		return false, nil
-	}
-
-	return true, nil
+type SecretStore struct {
+	secrets map[digest.Digest]*storedSecret
+	mu      sync.RWMutex
 }
 
-// secretIDPayload is the inner content of a SecretID.
-type secretIDPayload struct {
-	// FromFile specifies the FileID it is based off.
-	//
-	// Deprecated: this shouldn't be used as it can leak secrets in the cache.
-	// Use the setSecret API instead.
-	FromFile FileID `json:"file,omitempty"`
+// storedSecret has the actual metadata of the Secret. The Secret type is just it's key into the
+// SecretStore, which allows us to pass it around but still more easily enforce that any code that
+// wants to access it has to go through the SecretStore. So storedSecret has all the actual data
+// once you've asked for the secret from the store.
+type storedSecret struct {
+	*Secret
 
-	// FromHostEnv specifies the FileID it is based off.
-	//
-	// Deprecated: use the setSecret API instead.
-	FromHostEnv string `json:"host_env,omitempty"`
+	// The user-designated name of the secret.
+	Name string
 
-	// Name specifies the arbitrary name/id of the secret.
-	Name string `json:"name,omitempty"`
-
-	// Digest represents a digest of the plaintext of the secret.
-	Digest string `json:"digest,omitempty"`
+	// The plaintext value of the secret.
+	Plaintext []byte
 }
 
-// Encode returns the opaque string ID representation of the secret.
-func (payload *secretIDPayload) Encode() (SecretID, error) {
-	id, err := encodeID(payload)
-	if err != nil {
-		return "", err
+func NewSecretStore() *SecretStore {
+	return &SecretStore{
+		secrets: map[digest.Digest]*storedSecret{},
 	}
-
-	return SecretID(id), nil
 }
 
-func (id SecretID) decode() (*secretIDPayload, error) {
-	var payload secretIDPayload
-	if err := decodeID(&payload, id); err != nil {
-		return nil, err
+func (store *SecretStore) AddSecret(secret *Secret, name string, plaintext []byte) error {
+	if secret == nil {
+		return fmt.Errorf("secret must not be nil")
+	}
+	if secret.Query == nil {
+		return fmt.Errorf("secret must have a query")
+	}
+	if secret.IDDigest == "" {
+		return fmt.Errorf("secret must have an ID digest")
 	}
 
-	return &payload, nil
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	store.secrets[secret.IDDigest] = &storedSecret{
+		Secret:    secret,
+		Name:      name,
+		Plaintext: plaintext,
+	}
+	return nil
 }
 
-func (secret *Secret) Plaintext(ctx context.Context, gw bkgw.Client) ([]byte, error) {
-	payload, err := secret.ID.decode()
-	if err != nil {
-		return nil, err
+func (store *SecretStore) AddSecretFromOtherStore(secret *Secret, otherStore *SecretStore) error {
+	otherStore.mu.RLock()
+	secretVals, ok := otherStore.secrets[secret.IDDigest]
+	otherStore.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("secret %s not found in other store", secret.IDDigest)
 	}
+	return store.AddSecret(secret, secretVals.Name, secretVals.Plaintext)
+}
 
-	if payload.FromFile != "" {
-		file := &File{ID: payload.FromFile}
-		return file.Contents(ctx, gw)
+func (store *SecretStore) HasSecret(idDgst digest.Digest) bool {
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	_, ok := store.secrets[idDgst]
+	return ok
+}
+
+func (store *SecretStore) GetSecretName(idDgst digest.Digest) (string, bool) {
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	secret, ok := store.secrets[idDgst]
+	if !ok {
+		return "", false
 	}
+	return secret.Name, true
+}
 
-	if payload.FromHostEnv != "" {
-		return []byte(os.Getenv(payload.FromHostEnv)), nil
+func (store *SecretStore) GetSecretPlaintext(idDgst digest.Digest) ([]byte, bool) {
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	secret, ok := store.secrets[idDgst]
+	if !ok {
+		return nil, false
 	}
+	return secret.Plaintext, true
+}
 
-	return nil, fmt.Errorf("plaintext: empty secret?")
+func (store *SecretStore) AsBuildkitSecretStore() secrets.SecretStore {
+	return &buildkitSecretStore{inner: store}
+}
+
+// adapts our SecretStore to the interface buildkit wants
+type buildkitSecretStore struct {
+	inner *SecretStore
+}
+
+var _ secrets.SecretStore = &buildkitSecretStore{}
+
+func (bkStore *buildkitSecretStore) GetSecret(_ context.Context, llbID string) ([]byte, error) {
+	plaintext, ok := bkStore.inner.GetSecretPlaintext(digest.Digest(llbID))
+	if !ok {
+		return nil, fmt.Errorf("secret %s: %w", llbID, secrets.ErrNotFound)
+	}
+	return plaintext, nil
 }

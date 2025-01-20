@@ -1,14 +1,21 @@
 The best way to find a good contribution is to use Dagger for something. Then write down what problems you encounter.
-Could be as simple as a question you had, that the docs didn't answer. Or a bug in the tool, or a missing CUE package.
+Could be as simple as a question you had, that the docs didn't answer. Or a bug in the tool, or a missing feature.
 Then pick an item that you're comfortable with in terms of difficulty, and give it a try. 🙂
 
 You can ask questions along the way, we're always happy to help you with your contribution. The bigger the contribution,
 the earlier you should talk to maintainers to make sure you're taking the right approach and are not wasting your effort
 on something that will not get merged.
 
-## Package Style Guide
+## Building/Running/Testing
 
-If you're contributing to the project, be sure to follow the code style guides in our documentation.
+For more detailed instructions on building, running and testing dagger locally,
+see the dagger [dev module](https://github.com/dagger/dagger/tree/main/dagger.json).
+
+Working on dagger requires dagger to bootstrap it - you can install dagger
+using the instructions at [https://docs.dagger.io/install](https://docs.dagger.io/install).
+Because we dogfood all of our tooling ourselves, we recommend using the *most
+recent* version of dagger to build (you can find the exact version used in our
+ci by looking in `go.mod`).
 
 ## GitHub Workflow
 
@@ -22,10 +29,10 @@ The recommended workflow is to fork the repository and open pull requests from y
 
 ```shell
 # Clone repository
-git clone https://github.com/$YOUR_GITHUB_USER/$REPOSITORY.git
+git clone git@github.com:$YOUR_GITHUB_USER/dagger.git
 
 # Add upstream origin
-git remote add upstream git@github.com:dagger/$REPOSITORY.git
+git remote add upstream git@github.com:dagger/dagger.git
 ```
 
 ### 2. Create a pull request
@@ -43,10 +50,34 @@ git commit -s
 # Push your new feature branch
 git push my_feature_branch
 
-# Create a new pull request from https://github.com/dagger/$REPOSITORY
+# Create a new pull request from https://github.com/dagger/dagger
 ```
 
-### 3. Update your pull request with latest changes
+### 3. Add release notes fragment
+
+If this is a user-facing change, please add a line for the release notes.
+You will need to have [`changie` installed](https://changie.dev/guide/installation/).
+
+If this is a user-facing change in the 🚙 Engine or 🚗 CLI, run `changie new` in the top level directory.
+Here is an example of what that looks like:
+
+```shell
+changie new
+✔ Kind … Added
+✔ Body … engine: add `Directory.Sync`
+✔ GitHub PR … 5414
+✔ GitHub Author … helderco
+```
+
+If there are code changes in the SDKs, run `changie new` in the corresponding directory, e.g. `sdk/go`, `sdk/typescript`, etc.
+
+Remember to add & commit the release notes fragment.
+This will be used at release time, in the changelog.
+Here is an example of the end-result for all release notes fragments: [https://github.com/dagger/dagger/blob/v0.6.4/.changes/v0.6.4.md](https://github.com/dagger/dagger/blob/v0.6.4/.changes/v0.6.4.md)
+
+You can find an asciinema of how `changie` works on [https://changie.dev](https://changie.dev)
+
+### 4. Update your pull request with latest changes
 
 ```shell
 # Checkout main branch
@@ -84,13 +115,17 @@ approaches, and they work really well in the context of Dagger.
 
 ## Commits
 
+### License
+
+Contributions to this project are made under the Apache License 2.0 (Apache-2.0).
+
 ### DCO
 
 Contributions to this project must be accompanied by a Developer Certificate of
 Origin (DCO).
 
 All commit messages must contain the Signed-off-by line with an email address
-that matches the commit author. When commiting, use the `--signoff` flag:
+that matches the commit author. When committing, use the `--signoff` flag:
 
 ```shell
 git commit -s
@@ -112,8 +147,8 @@ Guidelines:
 - Each commit should work on its own: it must compile, pass the linter and so on.
   - This makes life much easier when using `git log`, `git blame`, `git bisect`, etc.
   - For instance, when doing a `git blame` on a file to figure out why a change
-  was introduced, it's pretty meaningless to see a _Fix linter_ commit message.
-  "Add Feature X" is much more meaningful.
+    was introduced, it's pretty meaningless to see a _Fix linter_ commit message.
+    "Add Feature X" is much more meaningful.
 - Use `git rebase -i main` to group commits together and rewrite their commit message.
 - To add changes to the previous commit, use `git commit --amend -s`. This will
   change the last commit (amend) instead of creating a new commit.
@@ -126,7 +161,7 @@ Guidelines:
   - `website:` for the documentation website (i.e., the frontend code; e.g., `website: Add X link to navbar`);
   - `ci:` for internal CI specific changes (e.g., `ci: Enable X for tests`);
   - `infra:` for infrastructure changes (e.g., `infra: Enable cloudfront for X`);
-  - `fix`:  for improvements and bugfixes that do not introduce a feature (e.g., `fix: improve error message`);
+  - `fix`: for improvements and bugfixes that do not introduce a feature (e.g., `fix: improve error message`);
   - `feat`: for new features (e.g., `feat: implement --cache-to feature to export cache`)
 
 [^1]: See [https://www.conventionalcommits.org](https://www.conventionalcommits.org)
@@ -148,63 +183,48 @@ prevent broken internal links. If a file gets renamed, the compiler will catch
 broken links and throw an error. [Learn
 more](https://docusaurus.io/docs/markdown-features/links).
 
-## FAQ
+## Vulnerability Scanning
 
-### How to run linters locally?
+We run trivy scanning of our engine image in GHA to scan for any CVEs present in any third-party binaries we build or that we include in the image (e.g. runc, CNI plugins, etc.). As of this writing, we currently only scan for Critical and High severity CVEs. If any of those are found the GHA job will fail.
 
-```shell
-# From the repository root, run all linters:
-dagger do lint
+It's sometimes possible that the vulnerability may require quite a bit of work to address, especially if it's coming from third-party binary or a transitive dependency in our go.mod that does not have a release with the fix yet.
 
-# Only run a specific linter:
-dagger do lint markdown
+- In this case, it's worth checking whether the specific vulnerability is actually relevant to us. If it's not or if you're unsure, reach out to the Dagger team on Github or Discord and we can figure out whether to address it or add it to an ignore list.
 
-# Look inside the ci.cue file to see all available linters
-```
+The rest of this section gives some guidance on fixing these vulnerabilities when they are relevant.
 
-### How to re-run all GitHub Actions jobs?
+### Vulnerability in a Dagger binary
 
-There isn't a button that Dagger contributors can click in their fork that will
-re-run all GitHub Actions jobs. See issue
-[#1169](https://github.com/dagger/dagger/issues/1169) for more context.
+If a vulnerability is reported in the Go stdlib, we'll want to upgrade the version of Go we use to build everything. As of this writing, this can be done by changing `GolangVersion` in `.dagger/consts/versions.go`.
 
-The current workaround is to re-create the last commit:
+Otherwise, if a vulnerability is reported in a Go dependency, you'll want to track down where the dependency is coming from.
 
-```shell
-git commit --amend -s
+This can become a bit complicated since it's possible for multiple versions of a Go module to be in the dependency DAG, with only a subset of the versions actually being vulnerable.
 
-# Force push the new commit to re-run all GitHub Actions jobs:
-git push -f mybranch
-```
+1. If the dependency at the vulnerable version is directly listed in our `go.mod`, then you should start by just upgrading it there.
+1. After that, if the vulnerability is still reported, it may be coming from a transitive dependency.
+   - You can track those down with the `go mod graph` command. For example, if the vulnerable module version is `golang.org/x/sys@v0.0.0-20211116061358-0a5406a5449c`, you can run `go mod graph | grep 'golang.org/x/sys@v0.0.0-20211116061358-0a5406a5449c'`.
 
-### Can I use a remote development environment?
+### Vulnerability in a third-party binary
 
-Yes! The Dagger repository has Github Codespaces configuration included to help you get started contributing directly from GitHub.
+If a vulnerability is reported in the Go stdlib, we'll want to upgrade the version of Go we use to build everything. As of this writing, this can be done by changing `GolangVersion` in `.dagger/consts/versions.go`.
 
-The versions of `dagger` and `cue` you are working against will be pre-installed so you can develop your packages, plans and tests with the right tools.
+Otherwise, you'll want to check if the binary in question has a newer version with the vulnerability gone. The versions of these binaries are also controlled in `.dagger/consts/versions.go`.
 
-You will also have basic syntax highlighting and formatting for CUE in Visual Studio Code via pre-installed extensions.
+If there isn't a newer version to upgrade to, we'll be in a tougher spot and may need some combination of upgrading to a non-released commit, sending patches upstream or (as a worst-case fallback) patching it ourselves. Reach out to the Dagger team on Github or Discord if you're unsure how to best proceed.
 
-Support for other platforms, such as Gitpod, may be added if there is demand. Visit the [developer experience](https://github.com/dagger/dagger/discussions/2052) discussion on GitHub to show your interest.
+### How to test SDK changes locally?
 
-### How can I add a new secret for integration tests?
+TypeScript:
 
-1/4. Ensure that you have [SOPS](https://github.com/mozilla/sops) installed.
+- In `sdk/typescript`, run `npm run build`
+- In your `package.json`, update `@dagger.io/dagger` to reference your local path. For example `"@dagger.io/dagger": "<PATH TO DAGGER FORK>/dagger/sdk/typescript",`
 
-2/4. Run the following from the top-level of your local repository fork:
+Python:
 
-```shell
-cd tests
-export SOPS_AGE_KEY_FILE="$PWD/age_key.txt"
-sops secrets_sops.yaml
-# Add a new secret with the correct value
-# Use one of the existing ones as an example
-```
+- While in a VirtualEnvironment, run `pip install <PATH TO DAGGER FORK>/sdk/python`
 
-3/4. Save the `tests/secrets_sops.yaml` file.
+Go:
 
-4/4. Commit and push the changes.
-
-:::warning
-Please note that anyone will be able to read all secrets stored in `tests/secrets_sops.yaml` by following the steps above.
-:::
+- In your Go project, run `go mod edit -replace dagger.io/dagger=<PATH TO DAGGER FORK>/sdk/go`
+- Then `go mod tidy`
